@@ -12,4 +12,18 @@ authors = ["Dominik Baumann <dominik.baumann@bbv.ch>"]
 
 [workspace.dependencies]
 
+#
+# Workspace member crates
+#
 
+proto = { path = "crates/proto" }
+
+
+#
+# External crates
+#
+axum = "0.8.7"
+tonic = "0.14.2"
+prost = "0.14.3"
+tonic-prost-build = "0.14.2"
+tokio = "1.49.0"
