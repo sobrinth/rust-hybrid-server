@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+
+members = ["crates/*"]
+default-members = ["crates/hybrid-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+authors = ["Dominik Baumann <dominik.baumann@bbv.ch>"]
+
+[workspace.dependencies]
+
+
