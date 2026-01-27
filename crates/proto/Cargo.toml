@@ -10,6 +10,7 @@ path = "src/proto.rs"
 [dependencies]
 tonic.workspace = true
 prost.workspace = true
+tonic-prost.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
