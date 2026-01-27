@@ -25,5 +25,7 @@ proto = { path = "crates/proto" }
 axum = "0.8.7"
 tonic = "0.14.2"
 prost = "0.14.3"
+hyper = "1.8.1"
+axum-server = "0.8.0"
 tonic-prost-build = "0.14.2"
 tokio = "1.49.0"
