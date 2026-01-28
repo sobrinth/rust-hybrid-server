@@ -2,6 +2,9 @@ syntax = "proto3";
 
 package helloworld;
 
+// Because i always forget how to do this
+// .\grpcurl.exe -plaintext -d '{"name": "KHALLAAAAA"}' -import-path H:\rust-hybrid-server\crates\proto\proto -proto sample.proto localhost:6003 helloworld.Greeter/SayHello
+
 // The greeting service definition.
 service Greeter {
   // Sends a greeting

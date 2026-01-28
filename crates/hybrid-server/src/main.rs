@@ -1,13 +1,14 @@
 use axum::body::HttpBody;
-use hyper::body::{Body, Frame};
-use hyper::{Request, Response};
+use hyper::body::{Frame, Incoming};
+use hyper::{Request as HyperRequest, Response as HyperResponse};
 use pin_project::pin_project;
 use proto::proto_files::greeter_server::{Greeter, GreeterServer};
 use proto::proto_files::{HelloReply, HelloRequest};
-use std::net::{Incoming, SocketAddr};
+use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tonic::Status;
+use tonic::{Request, Response, Status};
 use tower::Service;
 
 #[tokio::main]
@@ -19,9 +20,9 @@ async fn main() {
         .route("/", axum::routing::get(|| async { "Hello, HTTP" }))
         .into_make_service(); // TODO: Investigate `into_service()`
 
-    let grpc_service = tonic::service::Routes::builder()
-        .add_service(GreeterServer::new(MyGreeter::default()))
-        .routes();
+    let mut grpc_builder = tonic::service::Routes::builder();
+    grpc_builder.add_service(GreeterServer::new(MyGreeter::default()));
+    let grpc_service = grpc_builder.routes();
 
     let hybrid = hybrid(http_service, grpc_service);
 
@@ -58,19 +59,20 @@ where
     }
 }
 
+#[derive(Clone)]
 struct HybridService<Web, Grpc> {
     web: Web,
     grpc: Grpc,
 }
 
-impl<'a, Web, Grpc, WebBody, GrpcBody> Service<Request<Incoming<'a>>> for HybridService<Web, Grpc>
+impl<Web, Grpc, WebBody, GrpcBody> Service<HyperRequest<Incoming>> for HybridService<Web, Grpc>
 where
-    Web: Service<Request<Incoming<'a>>, Response = Response<WebBody>>,
-    Grpc: Service<Request<Incoming<'a>>, Response = Response<GrpcBody>>,
+    Web: Service<HyperRequest<Incoming>, Response = HyperResponse<WebBody>>,
+    Grpc: Service<HyperRequest<Incoming>, Response = HyperResponse<GrpcBody>>,
     Web::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     Grpc::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
-    type Response = Response<HybridBody<WebBody, GrpcBody>>;
+    type Response = HyperResponse<HybridBody<WebBody, GrpcBody>>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = HybridFuture<Web::Future, Grpc::Future>;
 
@@ -86,7 +88,7 @@ where
         }
     }
 
-    fn call(&mut self, req: Request<Incoming<'a>>) -> Self::Future {
+    fn call(&mut self, req: HyperRequest<Incoming>) -> Self::Future {
         if req.headers().get("content-type").map(|x| x.as_bytes()) == Some(b"application/grpc") {
             HybridFuture::Grpc(self.grpc.call(req))
         } else {
@@ -138,13 +140,13 @@ enum HybridFuture<WebFuture, GrpcFuture> {
 impl<WebFuture, GrpcFuture, WebBody, GrpcBody, WebError, GrpcError> Future
     for HybridFuture<WebFuture, GrpcFuture>
 where
-    WebFuture: Future<Output = Result<Response<WebBody>, WebError>>,
-    GrpcFuture: Future<Output = Result<Response<GrpcBody>, GrpcError>>,
+    WebFuture: Future<Output = Result<HyperResponse<WebBody>, WebError>>,
+    GrpcFuture: Future<Output = Result<HyperResponse<GrpcBody>, GrpcError>>,
     WebError: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     GrpcError: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
     type Output = Result<
-        Response<HybridBody<WebBody, GrpcBody>>,
+        HyperResponse<HybridBody<WebBody, GrpcBody>>,
         Box<dyn std::error::Error + Send + Sync + 'static>,
     >;
 
@@ -193,11 +195,16 @@ where
 #[derive(Debug, Default)]
 pub struct MyGreeter {}
 
+#[tonic::async_trait]
 impl Greeter for MyGreeter {
     async fn say_hello(
         &self,
         request: Request<HelloRequest>,
     ) -> Result<Response<HelloReply>, Status> {
-        todo!()
+        let name = request.into_inner().name;
+        let reply = HelloReply {
+            message: format!("Hello, {name}!"),
+        };
+        Ok(Response::new(reply))
     }
 }
