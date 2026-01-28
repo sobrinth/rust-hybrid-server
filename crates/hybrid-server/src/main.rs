@@ -1,203 +1,44 @@
-use axum::body::HttpBody;
-use hyper::body::{Frame, Incoming};
-use hyper::{Request as HyperRequest, Response as HyperResponse};
-use pin_project::pin_project;
+mod hybrid;
+
 use proto::proto_files::greeter_server::{Greeter, GreeterServer};
 use proto::proto_files::{HelloReply, HelloRequest};
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tonic::{Request, Response, Status};
-use tower::{Service, ServiceBuilder};
+use tower::ServiceBuilder;
 
 #[tokio::main]
 async fn main() {
-    println!("Hello, world!");
     let addr = SocketAddr::from(([0, 0, 0, 0], 6003));
+    println!("Listening on http://{}", addr);
 
     let http_service = axum::Router::new()
-        .route("/", axum::routing::get(|| async { "Hello, HTTP" }))
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                println!("Handling HTTP request");
+                "Hello, HTTP"
+            }),
+        )
         .into_make_service(); // TODO: Investigate `into_service()`
 
     let mut grpc_builder = tonic::service::Routes::builder();
     grpc_builder.add_service(GreeterServer::new(MyGreeter::default()));
     let grpc_service = grpc_builder.routes();
 
-    let hybrid_server = hybridize(http_service, grpc_service);
+    let hybrid_server = hybrid::combine(http_service, grpc_service);
 
     let configured_service = ServiceBuilder::new()
+        .rate_limit(5, Duration::from_secs(5))
         .buffer(5)
         .concurrency_limit(5)
-        .rate_limit(5, Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .service(hybrid_server);
 
-    axum_server::bind(addr).serve(configured_service).await.unwrap()
-}
-
-fn hybridize<MakeWeb, Grpc>(make_web: MakeWeb, grpc: Grpc) -> HybridMakeService<MakeWeb, Grpc> {
-    HybridMakeService { make_web, grpc }
-}
-
-struct HybridMakeService<MakeWeb, Grpc> {
-    make_web: MakeWeb,
-    grpc: Grpc,
-}
-
-impl<ConnInfo, MakeWeb, Grpc> Service<ConnInfo> for HybridMakeService<MakeWeb, Grpc>
-where
-    MakeWeb: Service<ConnInfo>,
-    Grpc: Clone,
-{
-    type Response = HybridService<MakeWeb::Response, Grpc>;
-    type Error = MakeWeb::Error;
-    type Future = HybridMakeServiceFuture<MakeWeb::Future, Grpc>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.make_web.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: ConnInfo) -> Self::Future {
-        HybridMakeServiceFuture {
-            web_future: self.make_web.call(req),
-            grpc: Some(self.grpc.clone()),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct HybridService<Web, Grpc> {
-    web: Web,
-    grpc: Grpc,
-}
-
-impl<Web, Grpc, WebBody, GrpcBody> Service<HyperRequest<Incoming>> for HybridService<Web, Grpc>
-where
-    Web: Service<HyperRequest<Incoming>, Response = HyperResponse<WebBody>>,
-    Grpc: Service<HyperRequest<Incoming>, Response = HyperResponse<GrpcBody>>,
-    Web::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    Grpc::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-{
-    type Response = HyperResponse<HybridBody<WebBody, GrpcBody>>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future = HybridFuture<Web::Future, Grpc::Future>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self.web.poll_ready(cx) {
-            Poll::Ready(Ok(())) => match self.grpc.poll_ready(cx) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-                Poll::Pending => Poll::Pending,
-            },
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn call(&mut self, req: HyperRequest<Incoming>) -> Self::Future {
-        if req.headers().get("content-type").map(|x| x.as_bytes()) == Some(b"application/grpc") {
-            HybridFuture::Grpc(self.grpc.call(req))
-        } else {
-            HybridFuture::Web(self.web.call(req))
-        }
-    }
-}
-
-#[pin_project(project = HybridBodyProj)]
-enum HybridBody<WebBody, GrpcBody> {
-    Web(#[pin] WebBody),
-    Grpc(#[pin] GrpcBody),
-}
-
-impl<WebBody, GrpcBody> HttpBody for HybridBody<WebBody, GrpcBody>
-where
-    WebBody: HttpBody + Send + Unpin,
-    GrpcBody: HttpBody<Data = WebBody::Data> + Send + Unpin,
-    WebBody::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    GrpcBody::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-{
-    type Data = WebBody::Data;
-    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.project() {
-            HybridBodyProj::Web(x) => x.poll_frame(cx).map_err(|e| e.into()),
-            HybridBodyProj::Grpc(x) => x.poll_frame(cx).map_err(|e| e.into()),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        match self {
-            HybridBody::Web(x) => x.is_end_stream(),
-            HybridBody::Grpc(x) => x.is_end_stream(),
-        }
-    }
-}
-
-#[pin_project(project = HybridFutureProj)]
-enum HybridFuture<WebFuture, GrpcFuture> {
-    Web(#[pin] WebFuture),
-    Grpc(#[pin] GrpcFuture),
-}
-
-impl<WebFuture, GrpcFuture, WebBody, GrpcBody, WebError, GrpcError> Future
-    for HybridFuture<WebFuture, GrpcFuture>
-where
-    WebFuture: Future<Output = Result<HyperResponse<WebBody>, WebError>>,
-    GrpcFuture: Future<Output = Result<HyperResponse<GrpcBody>, GrpcError>>,
-    WebError: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    GrpcError: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-{
-    type Output = Result<
-        HyperResponse<HybridBody<WebBody, GrpcBody>>,
-        Box<dyn std::error::Error + Send + Sync + 'static>,
-    >;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.project() {
-            HybridFutureProj::Web(x) => match x.poll(cx) {
-                Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(HybridBody::Web))),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-                Poll::Pending => Poll::Pending,
-            },
-            HybridFutureProj::Grpc(x) => match x.poll(cx) {
-                Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(HybridBody::Grpc))),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-                Poll::Pending => Poll::Pending,
-            },
-        }
-    }
-}
-
-#[pin_project]
-struct HybridMakeServiceFuture<WebFuture, Grpc> {
-    #[pin]
-    web_future: WebFuture,
-    grpc: Option<Grpc>,
-}
-
-impl<WebFuture, Web, WebError, Grpc> Future for HybridMakeServiceFuture<WebFuture, Grpc>
-where
-    WebFuture: Future<Output = Result<Web, WebError>>,
-{
-    type Output = Result<HybridService<Web, Grpc>, WebError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        match this.web_future.poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(web)) => Poll::Ready(Ok(HybridService {
-                web,
-                grpc: this.grpc.take().expect("Cannot poll twice!"),
-            })),
-        }
-    }
+    axum_server::bind(addr)
+        .serve(configured_service)
+        .await
+        .unwrap()
 }
 
 #[derive(Debug, Default)]
@@ -209,6 +50,7 @@ impl Greeter for MyGreeter {
         &self,
         request: Request<HelloRequest>,
     ) -> Result<Response<HelloReply>, Status> {
+        println!("Received request: {:?}", request);
         let name = request.into_inner().name;
         let reply = HelloReply {
             message: format!("Hello, {name}!"),
