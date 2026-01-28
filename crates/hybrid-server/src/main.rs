@@ -8,8 +8,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tonic::{Request, Response, Status};
-use tower::Service;
+use tower::{Service, ServiceBuilder};
 
 #[tokio::main]
 async fn main() {
@@ -24,12 +25,19 @@ async fn main() {
     grpc_builder.add_service(GreeterServer::new(MyGreeter::default()));
     let grpc_service = grpc_builder.routes();
 
-    let hybrid = hybrid(http_service, grpc_service);
+    let hybrid_server = hybridize(http_service, grpc_service);
 
-    axum_server::bind(addr).serve(hybrid).await.unwrap()
+    let configured_service = ServiceBuilder::new()
+        .buffer(5)
+        .concurrency_limit(5)
+        .rate_limit(5, Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .service(hybrid_server);
+
+    axum_server::bind(addr).serve(configured_service).await.unwrap()
 }
 
-fn hybrid<MakeWeb, Grpc>(make_web: MakeWeb, grpc: Grpc) -> HybridMakeService<MakeWeb, Grpc> {
+fn hybridize<MakeWeb, Grpc>(make_web: MakeWeb, grpc: Grpc) -> HybridMakeService<MakeWeb, Grpc> {
     HybridMakeService { make_web, grpc }
 }
 
