@@ -357,6 +357,7 @@ dependencies = [
  "axum",
  "axum-server",
  "hyper",
+ "pin-project",
  "proto",
  "tokio",
  "tonic",

@@ -14,3 +14,4 @@ tonic.workspace = true
 hyper = { workspace = true, features = ["full"]}
 proto.workspace = true
 tower = { workspace = true, features = ["full"]}
+pin-project.workspace = true
